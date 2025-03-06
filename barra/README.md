@@ -1,0 +1,6 @@
+Barra CNE6因子计算代码看相应因子名的py文件
+Barra CNE6因子收益率和特质性收益率计算看factor_return.py
+Barra CNE6因子收益率协方差矩阵的计算看corvariance_matrix.py
+Barra CNE6特质性风险矩阵的计算看spec_risk_matrix.py
+具体的代码说明关注公众号量化拯救散户
+需要数据的话可以从https://pan.quark.cn/s/3c724e7f0d8f获取，具体解压码查看微信公众号量化拯救散户
