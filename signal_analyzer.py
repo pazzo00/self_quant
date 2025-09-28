@@ -1,4 +1,3 @@
-import bisect
 from itertools import product, chain
 import pandas as pd
 from warnings import warn
@@ -6,8 +5,8 @@ import numpy as np
 import multiprocessing as mp
 from base_data_loader import BaseDataLoader
 from matplotlib import pyplot as plt
-from functools import partial
-
+from group_back_testing import GroupBackTesting
+from joblib import Parallel, delayed
 
 
 class SignalAnalyzer:
@@ -59,11 +58,6 @@ class SignalAnalyzer:
         signal_data.data = np.clip(signal_data.data, limit_down[:, :, np.newaxis], limit_up[:, :, np.newaxis])
 
     def neutralization(self, cap_data, cap_name, ind_data, ind_name):
-        if (cap_data is None and ind_data is None) or (not (hasattr(self, cap_data) and
-                                                            cap_name in self.__getattribute__(cap_data).cols) and
-                (not hasattr(self, ind_data) and ind_name in self.__getattribute__(ind_data).cols)):
-            warn('缺少市值数据和行业数据，无法进行行业市值中性化')
-            return
         signal_data = self.__getattribute__('signal_data')
         self.y = signal_data.data[:, 0, :]
 
@@ -74,15 +68,17 @@ class SignalAnalyzer:
             self.ind_data_numerical(ind_data, ind_name)
             x = self.ind_numerical[:]
 
-        if hasattr(self, cap_data) and cap_name in self.__getattribute__(cap_data).cols:
+        if cap_data is not None and hasattr(self, cap_data) and cap_name in self.__getattribute__(cap_data).cols:
             cap_data = self.__getattribute__('market_cap')
             x.append(np.log(cap_data.data[:, cap_data.cols[cap_name], np.newaxis, :]))
         else:
             warn('缺少市值数据，无法进行市值中性化')
 
+        if len(x) == 0:
+            warn('缺少市值数据和行业数据，无法进行行业市值中性化')
+            return
         self.x = np.concatenate(x, axis=1)
-        # with mp.Pool(processes=mp.cpu_count()) as pool:
-        #     res = pool.map(self.cal_residual, list(range(len(self.y))))
+
         res = []
         for i in range(len(self.y)):
             res.append(self.cal_residual(i))
@@ -111,14 +107,19 @@ class SignalAnalyzer:
         else:
             flag = ~np.isnan(x) & ~np.isnan(y)
             x_data, y_data = x[flag], y[flag]
+        if len(x_data) == 0:
+            return None
         x_b = np.c_[np.ones((x_data.shape[0], 1)), x_data]
         w = np.linalg.pinv(x_b.T @ x_b) @ x_b.T @ y_data
+
         return w
 
     def cal_residual(self, idx):
         x, y = self.x[idx, :, :].T, self.y[idx, :]
         w = self.__regression__(x, y)
-        return y - w @ np.c_[np.ones((x.shape[0], 1)), x].T
+        if w is not None:
+            return y - w @ np.c_[np.ones((x.shape[0], 1)), x].T
+        return [np.nan] * len(y)
 
     def align(self):
         signal_data = self.__getattribute__('signal_data')
@@ -127,17 +128,22 @@ class SignalAnalyzer:
             signal_data.data = signal_data.data[:-1]
             signal_data.trade_days = signal_data.trade_days[1:]
 
-    def get_ret_and_signal(self):
+    def get_signal(self, sampling=False):
         if self.signal_df is None:
             signal_df = self.__getattribute__('signal_data').to_dataframe()
+            self.balance_idx = list(range(0, len(signal_df), self.freq))
+            self.signal_df = signal_df
+
+    def get_ret(self):
+        if self.ret_df is None:
             ret_df = self.__getattribute__('ret_data').to_dataframe()
             ret_df = ret_df.shift(-self.freq) / ret_df - 1
             ret_df = ret_df.dropna(how='all')
-            self.signal_df = signal_df
             self.ret_df = ret_df
 
     def ic_analysis(self, ind_data=None, ind_name=None):
-        self.get_ret_and_signal()
+        self.get_signal()
+        self.get_ret()
         rank_ic = self.signal_df.reindex(self.ret_df.index).corrwith(self.ret_df, method='spearman', axis=1)
 
         args = [(rank_ic, '')]
@@ -206,14 +212,12 @@ class SignalAnalyzer:
         return tmp
 
     def regression_analysis(self):
-        self.get_ret_and_signal()
+        self.get_ret()
+        self.get_signal()
         self.x = self.signal_df.values
         y = self.ret_df.reindex(self.signal_df.index).dropna(how='all')
         time_index = y.index
         self.y = y.values
-        # # 多进程
-        # with mp.Pool(processes=mp.cpu_count()) as pool:
-        #     res = pool.map(self.__regression_analysis__, list(range(len(self.y))))
 
         res = []
         for i in range(len(self.y)):
@@ -239,9 +243,11 @@ class SignalAnalyzer:
         x, y = self.x[idx, :], self.y[idx, :]
         x = (x - np.nanmean(x)) / np.nanstd(x)
         w = self.__regression__(x, y)
-        return w[-1]
+        if w is not None:
+            return w[-1]
+        return None
 
-    def return_analysis(self, weights_mode, data_name=None):
+    def return_analysis(self, weights_mode, data_name=None, non_linear=False):
         assert weights_mode == 'equal' or (
                 hasattr(self, data_name) and weights_mode in self.__getattribute__(data_name).cols.keys()), \
             '输入的权重不合法'
@@ -250,41 +256,35 @@ class SignalAnalyzer:
         self.ret_1d = self.ret_1d / self.ret_1d.shift(1) - 1
         self.ret_1d = self.ret_1d.dropna(how='all')
 
-        self.get_ret_and_signal()
+        self.get_signal()
+        if non_linear:
+            self.signal_df = np.sign(self.signal_df) * np.abs(self.signal_df) ** 1.5
+
+        signal_df = self.signal_df.iloc[self.balance_idx]
         self.cal_weights(weights_mode, data_name)
 
-        start = self.ret_1d.index.tolist().index(self.signal_df.iloc[[0]].index)
-        self.ret_1d = self.ret_1d.iloc[start:]
-        # # 多进程
-        # with mp.Pool(processes=mp.cpu_count()) as pool:
-        #     group_ret = pool.map(self.cal_group_ret, list(range(1, len(self.ret_1d))))
-
-        group_ret = []
-        for i in range(1, len(self.ret_1d), 1):
-            group_ret.append(self.cal_group_ret(i))
-        group_ret = [[0] * self.bins] + group_ret
-        group_ret = pd.DataFrame(data=group_ret, index=self.ret_1d.index, columns=self.weights.keys())
-        group_ret.to_csv('./ret.csv')
-        group_ret = (1 + group_ret).cumprod()
+        gb_analysis = GroupBackTesting(self.ret_1d, signal_df, weights=self.weights)
+        group_ret = gb_analysis()
 
         self.plot(group_ret, '分层回测', x_name='time', mode='line')
 
     def cal_weights(self, weights_mode, data_name):
         if self.weights is None:
-            self.balance_idx = list(range(0, len(self.signal_df), self.freq))
-            # # 多进程
-            # with mp.Pool(processes=mp.cpu_count()) as pool:
-            #     weights = pool.map(partial(self.__cal_weights__, weights_mode, data_name), self.balance_idx)
 
-            weights = []
-            for idx in self.balance_idx:
-                weights.append(self.__cal_weights__(weights_mode, data_name, idx))
-            self.weights = {}
-            for i in range(self.bins):
-                self.weights['group_{}'.format(i)] = pd.concat([row[i] for row in weights]).groupby('index')
+            # weights = []
+            # for idx in range(len(self.signal_df)):
+            #     weights.append(self.__cal_weights__(weights_mode, data_name, idx))
+
+            weights = Parallel(n_jobs=16, verbose=10)(
+                delayed(self.__cal_weights__)(weights_mode, data_name, idx)
+                for idx in range(len(self.balance_idx))
+            )
+            weights = list(zip(*weights))
+            self.weights = [pd.concat(weight, axis=1).T for weight in weights]
+
 
     def __cal_weights__(self, weights_mode, data_name, idx):
-        signal = self.signal_df.iloc[[idx]].T
+        signal = self.signal_df.iloc[[self.balance_idx[idx]]].T
         signal = signal.dropna()
         day = signal.columns[0]
         signal.columns = ['signal']
@@ -294,108 +294,66 @@ class SignalAnalyzer:
             signal = signal.join(weights_df)
         signal.sort_values(by='signal', inplace=True)
 
-        gap = len(signal) // self.bins
-
         weights = []
-        for i in range(self.bins):
-            if i != self.bins - 1:
-                tmp = signal.iloc[i * gap: (i + 1) * gap]
-            else:
-                tmp = signal.iloc[i * gap:]
-            if weights_mode == 'equal':
-                tmp['weight'] = 1 / len(tmp)
-            else:
-                tmp['weight'] = tmp['weight'] / tmp['weight'].sum()
-            tmp = tmp[['weight']]
-            tmp.index.name = 'code'
-            tmp['index'] = idx
-            tmp['datetime'] = day
-            weights.append(tmp)
+        total = len(signal)
+        start = 0
+        for end_pos in range(1, self.bins + 1, 1):
+            end = int(total * end_pos / self.bins)
+            tmp_signal = signal.iloc[start: end]
+            start = end
+            tmp_signal['weight'] = tmp_signal['weight'] / tmp_signal['weight'].sum()
+            weights.append(tmp_signal['weight'])
         return weights
 
-    def cal_group_ret(self, idx):
-        data = self.ret_1d.iloc[idx]
-        balance_id = bisect.bisect_left(self.balance_idx, idx) - 1
-        res = []
-        for v in self.weights.values():
-            v = v.get_group(self.balance_idx[balance_id])
-            tmp = v[['weight']].join(data)
-            tmp = tmp.fillna(0)
-            res.append(tmp.iloc[:, 0].dot(tmp.iloc[:, 1]))
-        return res
-
     def turnover_analysis(self, weights_mode, data_name=None, ind_data=None, ind_name=None):
-        self.get_ret_and_signal()
+        self.get_ret()
+        self.get_signal()
         self.cal_weights(weights_mode, data_name)
 
-        # # 多进程
-        # with mp.Pool(processes=mp.cpu_count()) as pool:
-        #     group_turnover = pool.map(self.__turnover_analysis__, list(range(1, len(self.balance_idx))))
-
-        group_turnover = []
-        for i in range(1, len(self.balance_idx)):
-            group_turnover.append(self.__turnover_analysis__(i))
-        group_turnover = pd.Series(data=np.nanmean(group_turnover, axis=0), index=self.weights.keys())
+        index_list = ['group_{}'.format(_) for _ in range(self.bins)]
+        group_turnover = self.__turnover_analysis__()
+        group_turnover = pd.Series(data=group_turnover, index=index_list)
         self.plot(group_turnover, '每次调仓的平均换手率', x_name='', mode='bar')
 
         if ind_data is None or (
                 not (hasattr(self, ind_data) and ind_name in self.__getattribute__(ind_data).cols)):
             warn('没有行业板块数据，不进行行业板块换手率分析')
             return
-        group_ind_turnover = []
-        for i in range(1, len(self.balance_idx)):
-            group_ind_turnover.append(self.__ind_turnover_analysis__(ind_data, ind_name, i))
+        group_ind_turnover = self.__ind_turnover_analysis__()
 
-        # # 多进程
-        # with mp.Pool(processes=mp.cpu_count()) as pool:
-        #     group_ind_turnover = pool.map(partial(self.__ind_turnover_analysis__, ind_data, ind_name),
-        #                                   list(range(1, len(self.balance_idx))))
-
-        group_ind_turnover = pd.Series(data=np.nanmean(group_ind_turnover, axis=0), index=self.weights.keys())
+        group_ind_turnover = pd.Series(data=group_ind_turnover, index=index_list)
         self.plot(group_ind_turnover, '每次调仓的平均行业换手率', x_name='', mode='bar')
 
-    def __turnover_analysis__(self, idx, last_ind=None, ind=None):
+    def __turnover_analysis__(self):
         res = []
-        for key in self.weights:
-            data = self.weights[key]
-            last_weights = data.get_group(self.balance_idx[idx - 1])[['weight']]
-            last_weights.rename(columns={'weight': 'last_weight'}, inplace=True)
-            weights = data.get_group(self.balance_idx[idx])[['weight']]
-            if last_ind is not None:
-                last_weights = last_weights.join(last_ind).groupby('ind_name').sum()
-                weights = weights.join(ind).groupby('ind_name').sum()
-            weights = weights.join(last_weights, how='outer')
-            weights = weights.fillna(0)
-            res.append(np.sum(np.abs(weights.iloc[:, 0] - weights.iloc[:, 1])) / 2)
+        for group_weight in self.weights:
+            group_weight = group_weight.fillna(0).diff().abs()
+            res.append((group_weight.sum(axis=1) / 2).mean())
         return res
 
-    def __ind_turnover_analysis__(self, ind_data, ind_name, idx):
-        last_ind = self.get_ind_data_by_day(ind_data, ind_name, self.signal_df.index[self.balance_idx[idx - 1]])
-        ind = self.get_ind_data_by_day(ind_data, ind_name, self.signal_df.index[self.balance_idx[idx]])
-        return self.__turnover_analysis__(idx, last_ind, ind)
-
-    def get_ind_data_by_day(self, ind_data, ind_name, day):
-        data = self.__getattribute__(ind_data).get_window_df(ind_name, 0, day).T
-        data.columns = ['ind_name']
-        return data
+    def __ind_turnover_analysis__(self):
+        ind_data = np.array(self.ind_numerical)[:, self.balance_idx, 0, :]
+        res = []
+        for group_weight in self.weights:
+            group_weight = group_weight.reindex(columns=self.ind_data.codes).fillna(0)
+            group_weight = np.sum(group_weight.values[np.newaxis, :, :] * ind_data, axis=2)
+            res.append(np.mean(np.sum(np.abs(np.diff(group_weight, axis=1)), axis=0) / 2))
+        return res
 
     def attribution_analysis(self, weights_mode, factor_data, data_name=None):
-        self.get_ret_and_signal()
+        self.get_ret()
+        self.get_signal()
         self.cal_weights(weights_mode, data_name)
         data_info, fields = self.dict_product(factor_data)
 
         group_attribution = []
         for arg in data_info:
-            # # 多进程
-            # with mp.Pool(processes=4) as pool:
-            #     res = pool.map(partial(self.__attribution_analysis__, arg[0], arg[1]), self.balance_idx)
-
             res = []
-            for i in self.balance_idx:
+            for i in range(len(self.signal_df)):
                 res.append(self.__attribution_analysis__(arg[0], arg[1], i))
             group_attribution.append(res)
         group_attribution = pd.DataFrame(data=np.nanmean(group_attribution, axis=1), index=fields,
-                                         columns=self.weights.keys())
+                                         columns=['group_{}'.format(_) for _ in range(self.bins)])
         self.plot(group_attribution, '每组归因分析', x_name='因子名', mode='bar', rotation=0)
 
     def __attribution_analysis__(self, data_name, field_name, idx):
@@ -403,57 +361,11 @@ class SignalAnalyzer:
         day = self.signal_df.index[idx]
         data = self.__getattribute__(data_name).get_window_df(field_name, 0, day)
         data = data.sub(data.mean(axis=1), axis=0).div(data.std(axis=1), axis=0).T
-        for key in self.weights:
-            weights = self.weights[key].get_group(idx)[['weight']]
-            weights = weights.join(data)
-            weights = weights.dropna()
-            res.append(weights.iloc[:, 0].dot(weights.iloc[:, 1]))
+        for group_weight in self.weights:
+            group_weight = group_weight.join(data)
+            group_weight = group_weight.dropna()
+            res.append(group_weight.iloc[:, 0].dot(group_weight.iloc[:, 1]))
         return res
-
-    # 嵌套多进程，速度变慢
-    # def attribution_analysis(self, weights_mode, factor_data, data_name=None):
-    #     self.get_ret_and_signal()
-    #     self.cal_weights(weights_mode, data_name)
-    #     data_info, fields = self.dict_product(factor_data)
-    #
-    #     queue = Queue()
-    #     processes = []
-    #     for arg in data_info:
-    #         process = Process(target=self.__attribution_analysis__, args=(arg, queue))
-    #         processes.append(process)
-    #         process.start()
-    #
-    #     for process in processes:
-    #         process.join()
-    #     group_attribution = [queue.get() for _ in range(len(data_info))]
-    #
-    #     group_attribution = pd.DataFrame(data=np.nanmean(group_attribution, axis=1), index=fields,
-    #                                   columns=self.weights.keys())
-    #     self.plot(group_attribution, '每组归因分析', x_name='因子名', mode='bar', rotation=0)
-    #
-    # def __attribution_analysis__(self, args, queue):
-    #     new_queue = Queue()
-    #     processes = []
-    #     for idx in self.balance_idx:
-    #         process = Process(target=self.__attribution_analysis_by_day__, args=(idx, args[0], args[1], new_queue))
-    #         processes.append(process)
-    #         process.start()
-    #
-    #     for process in processes:
-    #         process.join()
-    #     queue.put([new_queue.get() for _ in range(len(self.balance_idx))])
-    #
-    # def __attribution_analysis_by_day__(self, idx, data_name, field_name, queue):
-    #     res = []
-    #     day = self.signal_df.index[idx]
-    #     data = self.__getattribute__(data_name).get_window_df(field_name, 0, day)
-    #     data = data.sub(data.mean(axis=1), axis=0).div(data.std(axis=1), axis=0).T
-    #     for key in self.weights:
-    #         weights = self.weights[key].get_group(idx)[['weight']]
-    #         weights = weights.join(data)
-    #         weights = weights.dropna()
-    #         res.append(weights.iloc[:, 0].dot(weights.iloc[:, 1]))
-    #     queue.put(res)
 
     def dict_product(self, data_info_dict):
         data_info = []
@@ -468,15 +380,13 @@ class SignalAnalyzer:
         return list(product(*[k, v]))
 
     def corr_analysis(self, data_name):
-        self.get_ret_and_signal()
+        self.get_ret()
+        self.get_signal()
         data_info, fields = self.dict_product(data_name)
         corr_res = []
         for info in data_info:
             corr_res.append(self.__corr_analysis__(info))
 
-        # # 多进程
-        # with mp.Pool(processes=4) as pool:
-        #     corr_res = pool.map(self.__corr_analysis__, data_info)
         corr_res = pd.Series(data=corr_res, index=fields)
         self.plot(corr_res, '相关性分析', '因子名', mode='bar')
 
@@ -502,31 +412,3 @@ class SignalAnalyzer:
         plt.tight_layout()
         plt.grid(axis='y', linestyle='--', alpha=0.7)
         plt.savefig(title.replace(' ', '_') + '_' + ind + '.png', format='png', dpi=1000)
-
-
-if __name__ == '__main__':
-    data_dict = {
-        'signal_data': {'path': './数据/stock_bar_1day.parquet',
-                        'start': '2018-01-01',
-                        'end': '2021-01-01', 'fields': ['volume']},
-        'ret_data': {'path': './数据/stock_bar_1day.parquet', 'fields': ['close'], 'start': '2018-01-01',
-                     'end': '2021-03-01'},
-        'market_cap': {'path': './数据/capital.parquet',
-                       'fields': ['market_cap', 'circulating_cap', 'pe_ratio', 'turnover_ratio', 'pb_ratio'],
-                       'start': '2018-01-01', 'end': '2021-01-01'},
-        'ind_data': {'path': './数据/sw_industry.parquet', 'fields': ['sw_l1_code'], 'start': '2018-01-01',
-                     'end': '2021-01-01'},
-        'factor_data': {'path': './数据/stock_bar_1day.parquet', 'fields': ['turnover', 'volume'],
-                        'start': '2018-01-01', 'end': '2021-01-01'}
-    }
-    sa = SignalAnalyzer(data_dict, freq=21, offset='close')
-    sa.pre_transform('market_cap', 'market_cap', 'ind_data', 'sw_l1_code')
-    sa.ic_analysis('ind_data', 'sw_l1_code')
-    # sa.regression_analysis()
-    # sa.return_analysis('equal')
-    # sa.turnover_analysis('equal', ind_data='ind_data', ind_name='sw_l1_code')
-    # sa.attribution_analysis('equal',
-    #                         {'market_cap': ['market_cap', 'circulating_cap', 'turnover_ratio', 'pe_ratio', 'pb_ratio'],
-    #                          'factor_data': ['turnover', 'volume']})
-    # sa.corr_analysis({'market_cap': ['market_cap', 'circulating_cap', 'turnover_ratio', 'pe_ratio', 'pb_ratio'],
-    #                          'factor_data': ['turnover', 'volume']})

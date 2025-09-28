@@ -59,6 +59,16 @@ class BaseDataLoader:
         cols = {k: v for v, k in enumerate(fields)}
         return cls(data, codes, cols, trade_days)
 
+    @classmethod
+    def from_dataframes(cls, dfs, codes, trade_days):
+        fields = list(dfs.keys())
+        data = pd.concat(list(dfs.values()), axis=1, keys=fields)
+        raw_columns = pd.MultiIndex.from_product([fields, codes])
+        data = data.reindex(raw_columns, axis='columns')
+        data = data.values.reshape(-1, len(fields), len(codes))
+        cols = {k: v for v, k in enumerate(fields)}
+        return cls(data, codes, cols, trade_days)
+
     @staticmethod
     def get_time_range(start, end, lag=0):
         filters = []
@@ -84,6 +94,9 @@ class BaseDataLoader:
         return pd.DataFrame(index=self.trade_days[start:idx], columns=self.codes,
                             data=self.data[start:idx, self.cols[field], :])
 
+    def get_series_by_idx(self, field, idx):
+        return pd.Series(data=self.data[idx, self.cols[field], :], index=self.codes, name=field)
+
     def to_dataframes(self):
         return {k: pd.DataFrame(data=self.data[:, v, :],
                                     index=self.trade_days, columns=self.codes) for k, v in self.cols.items()}
@@ -97,6 +110,6 @@ class BaseDataLoader:
 
 
 if __name__ == '__main__':
-    test = BaseDataLoader.load_data('./数据/stock_bar_1day.parquet', codes=['000001.SZ', '000002.SZ'])
+    test = BaseDataLoader.load_data('data/stock_bar_1day.parquet', codes=['000001.SZ', '000002.SZ'])
     x = test.to_dataframes()
     y = 1

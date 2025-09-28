@@ -4,6 +4,10 @@ from warnings import warn
 import bisect
 from base_data_loader import BaseDataLoader
 from datetime import timedelta
+import time
+from multiprocessing import RawArray
+from joblib import Parallel, delayed
+import itertools
 
 
 class ReportDataLoader(BaseDataLoader):
@@ -61,10 +65,10 @@ class ReportDataLoader(BaseDataLoader):
         filters = cls.get_time_range(start, end)
         if trade_days is None:
             if not filters:
-                trade_days = pd.read_parquet('../../数据/stock_bar_1day.parquet',
+                trade_days = pd.read_parquet('data/stock_bar_1day.parquet',
                                              columns=['datetime'], engine='pyarrow')
             else:
-                trade_days = pd.read_parquet('../../数据/stock_bar_1day.parquet',
+                trade_days = pd.read_parquet('data/stock_bar_1day.parquet',
                                              columns=['datetime'], engine='pyarrow', filters=filters)
             trade_days = sorted(trade_days['datetime'].unique().tolist())
 
@@ -108,7 +112,7 @@ class ReportDataLoader(BaseDataLoader):
             if not isinstance(day, str): day = day.strftime('%Y-%m-%d')
             tmp_idx = bisect.bisect_right(report_periods, day) - 1
             tmp_data = cls.get_newest_data(report_data_dict[report_periods[tmp_idx]],
-                                                        'report_period', day)
+                                                            'report_period', day)
             tmp_idx = np.array([tmp_idx] * len(codes))
             if len(tmp_data) == 0:
                 tmp_idx = tmp_idx - 1
@@ -119,33 +123,87 @@ class ReportDataLoader(BaseDataLoader):
         return np.array(idx) + 1
 
 
+    # @classmethod
+    # def get_lag_data(cls, idx, lag, mode, fields, trade_days, report_periods, report_data_dict, codes):
+    #     data, cols = [], []
+    #     for _ in range(lag + 1):
+    #         idx -= 1
+    #         unique_idx = np.unique(idx)
+    #         for col in fields:
+    #             lag_data = []
+    #             for unique_i in unique_idx:
+    #                 tmp_data = cls.get_newest_data(report_data_dict[report_periods[unique_i]], col)
+    #                 if tmp_data.iloc[[-1]].index <= trade_days[0]:
+    #                     tmp_data = tmp_data.iloc[[-1]]
+    #                 else:
+    #                     last_data = tmp_data[tmp_data.index < trade_days[0]].tail(1)
+    #                     tmp_data = pd.concat([last_data, tmp_data.reindex(trade_days)]).ffill()
+    #                     if len(last_data):
+    #                         tmp_data = tmp_data.iloc[1:]
+    #                 tmp_data = tmp_data.reindex(columns=codes, fill_value=np.nan)
+    #                 flag = idx == unique_i
+    #                 flag = np.where(flag, 1.0, np.nan)
+    #                 if len(lag_data) == 0:
+    #                     lag_data = flag * tmp_data.values
+    #                 else:
+    #                     lag_data = np.nanmean([lag_data, flag * tmp_data.values], axis=0)
+    #             data.append(lag_data)
+    #             cols.append(col + '_lag{}'.format(_) + mode)
+    #     data = np.transpose(np.array(data), (1, 0, 2))
+    #     cols = {k: v for v, k in enumerate(cols)}
+    #     return data, cols
+
     @classmethod
     def get_lag_data(cls, idx, lag, mode, fields, trade_days, report_periods, report_data_dict, codes):
         data, cols = [], []
-        for lag in range(lag + 1):
+        num_days, num_codes, num_cols = len(trade_days), len(codes), len(fields)
+        col_dict = {k: v for v, k in enumerate(fields)}
+        for _ in range(lag + 1):
             idx -= 1
             unique_idx = np.unique(idx)
-            for col in fields:
-                lag_data = []
-                for unique_i in unique_idx:
-                    tmp_data = cls.get_newest_data(report_data_dict[report_periods[unique_i]], col)
-                    if tmp_data.iloc[[-1]].index <= trade_days[0]:
-                        tmp_data = tmp_data.iloc[[-1]]
-                    else:
-                        last_data = tmp_data[tmp_data.index < trade_days[0]].tail(1)
-                        tmp_data = pd.concat([last_data, tmp_data.reindex(trade_days)]).ffill()
-                        if len(last_data):
-                            tmp_data = tmp_data.iloc[1:]
+
+            lag_data = RawArray('d', num_cols * num_days * num_codes)
+            lag_data = np.frombuffer(lag_data, dtype=np.float64).reshape(num_cols, num_days, num_codes)
+            lag_data[:] = np.nan
+
+            def process_unique_i(col, unique_i):
+                if unique_i < 0:
+                    return
+                flag_2d = np.array(idx == unique_i)
+                day_flags = np.any(flag_2d, axis=1)
+                flag_2d = np.where(flag_2d[day_flags], 1, np.nan)
+                true_trade_days = trade_days[day_flags]
+                tmp_data = cls.get_newest_data(report_data_dict[report_periods[unique_i]], col)
+                if tmp_data.iloc[[-1]].index <= true_trade_days[0]:
+                    tmp_data = tmp_data.iloc[[-1]].dropna(how='all')
+                    if len(tmp_data) == 0:
+                        return
+                else:
+                    last_data = tmp_data[tmp_data.index < true_trade_days[0]].tail(1)
+                    tmp_data = pd.concat([last_data, tmp_data.reindex(true_trade_days)]).ffill()
                     tmp_data = tmp_data.reindex(columns=codes, fill_value=np.nan)
-                    flag = idx == unique_i
-                    flag = np.where(flag, 1.0, np.nan)
-                    if len(lag_data) == 0:
-                        lag_data = flag * tmp_data.values
-                    else:
-                        lag_data = np.nanmean([lag_data, flag * tmp_data.values], axis=0)
-                data.append(lag_data)
-                cols.append(col + '_lag{}'.format(lag) + mode)
+                    if len(last_data):
+                        tmp_data = tmp_data.iloc[1:]
+                tmp_data = tmp_data.reindex(columns=codes, fill_value=np.nan).values * flag_2d
+
+                fill_data = lag_data[col_dict[col], day_flags]
+                mask = ~np.isnan(tmp_data)
+                fill_data[mask] = tmp_data[mask]
+                lag_data[col_dict[col], day_flags] = fill_data
+
+            Parallel(n_jobs=8, verbose=10, backend='threading')(
+                delayed(process_unique_i)(c, u_idx) for c, u_idx in list(itertools.product(fields, unique_idx)))
+            data.append(lag_data)
+            cols += [col + '_lag{}'.format(_) + mode for col in cols]
+
+        data = np.concatenate(data, axis=0)
         data = np.transpose(np.array(data), (1, 0, 2))
         cols = {k: v for v, k in enumerate(cols)}
         return data, cols
+
+
+if __name__ == '__main__':
+    start = time.time()
+    ReportDataLoader.load_data('data/report_balance.parquet', fields=['total_assets'], lag='4Q')
+    print(time.time() - start)
 
