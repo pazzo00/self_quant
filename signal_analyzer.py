@@ -136,7 +136,11 @@ class SignalAnalyzer:
 
     def get_ret(self):
         if self.ret_df is None:
-            ret_df = self.__getattribute__('ret_data').to_dataframe()
+            ret_df = self.__getattribute__('ret_data').to_dataframes()
+            if 'factor' in ret_df:
+                ret_df = ret_df['close'] * ret_df['factor']
+            else:
+                ret_df = ret_df['close']
             ret_df = ret_df.shift(-self.freq) / ret_df - 1
             ret_df = ret_df.dropna(how='all')
             self.ret_df = ret_df
@@ -176,7 +180,6 @@ class SignalAnalyzer:
             rank_ic.index = rank_ic.index.date
             self.plot(rank_ic, 'IC', 'time', ind, mode='line')
 
-            # 不能开进程池了，可以换个方式继续多进程，然后测试一下多进程套用多进程的代码
             ic_cumsum = []
             for i in range(self.freq):
                 ic_cumsum.append(self.split_by_freq(rank_ic, 0, i))
@@ -248,11 +251,15 @@ class SignalAnalyzer:
         return None
 
     def return_analysis(self, weights_mode, data_name=None, non_linear=False):
-        assert weights_mode == 'equal' or (
+        assert weights_mode in ['equal', 'scale', 'rank', 'sqrt_market_cap'] or (
                 hasattr(self, data_name) and weights_mode in self.__getattribute__(data_name).cols.keys()), \
             '输入的权重不合法'
 
-        self.ret_1d = self.__getattribute__('ret_data').to_dataframe()
+        self.ret_1d = self.__getattribute__('ret_data').to_dataframes()
+        if 'factor' in self.ret_1d:
+            self.ret_1d = self.ret_1d['close'] * self.ret_1d['factor']
+        else:
+            self.ret_1d = self.ret_1d['close']
         self.ret_1d = self.ret_1d / self.ret_1d.shift(1) - 1
         self.ret_1d = self.ret_1d.dropna(how='all')
 
@@ -271,25 +278,25 @@ class SignalAnalyzer:
     def cal_weights(self, weights_mode, data_name):
         if self.weights is None:
 
-            # weights = []
-            # for idx in range(len(self.signal_df)):
-            #     weights.append(self.__cal_weights__(weights_mode, data_name, idx))
+            weights = []
+            for idx in range(len(self.balance_idx)):
+                weights.append(self.__cal_weights__(weights_mode, data_name, idx))
 
-            weights = Parallel(n_jobs=16, verbose=10)(
-                delayed(self.__cal_weights__)(weights_mode, data_name, idx)
-                for idx in range(len(self.balance_idx))
-            )
+            # weights = Parallel(n_jobs=16, verbose=10)(
+            #     delayed(self.__cal_weights__)(weights_mode, data_name, idx)
+            #     for idx in range(len(self.balance_idx))
+            # )
             weights = list(zip(*weights))
             self.weights = [pd.concat(weight, axis=1).T for weight in weights]
-
 
     def __cal_weights__(self, weights_mode, data_name, idx):
         signal = self.signal_df.iloc[[self.balance_idx[idx]]].T
         signal = signal.dropna()
         day = signal.columns[0]
         signal.columns = ['signal']
-        if weights_mode != 'equal':
-            weights_df = self.__getattribute__(data_name).get_window_df(weights_mode, 0, day).T
+        if weights_mode not in ['equal', 'scale', 'rank']:
+            data_field = 'market_cap' if 'market_cap' in weights_mode else weights_mode
+            weights_df = self.__getattribute__(data_name).get_window_df(data_field, 0, day).T
             weights_df.columns = ['weight']
             signal = signal.join(weights_df)
         signal.sort_values(by='signal', inplace=True)
@@ -301,6 +308,19 @@ class SignalAnalyzer:
             end = int(total * end_pos / self.bins)
             tmp_signal = signal.iloc[start: end]
             start = end
+            if weights_mode == 'equal':
+                tmp_signal['weight'] = 1
+            elif 'market_cap' in weights_mode:
+                tmp_signal['weight'] = tmp_signal['weight']
+                if 'sqrt' in weights_mode:
+                    tmp_signal['weight'] = np.sqrt(tmp_signal['weight'])
+                tmp_signal['weight'] = tmp_signal['weight'] / tmp_signal['weight'].sum()
+            elif weights_mode == 'rank':
+                tmp_signal['weight'] = tmp_signal['signal'].rank(pct=True)
+            elif weights_mode == 'scale':
+                up = tmp_signal['signal'].max()
+                low = tmp_signal['signal'].min()
+                tmp_signal['weight'] = (tmp_signal['signal'] - low) / (up - low)
             tmp_signal['weight'] = tmp_signal['weight'] / tmp_signal['weight'].sum()
             weights.append(tmp_signal['weight'])
         return weights
@@ -412,3 +432,4 @@ class SignalAnalyzer:
         plt.tight_layout()
         plt.grid(axis='y', linestyle='--', alpha=0.7)
         plt.savefig(title.replace(' ', '_') + '_' + ind + '.png', format='png', dpi=1000)
+
