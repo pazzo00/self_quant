@@ -8,6 +8,8 @@ import time
 from multiprocessing import RawArray
 from joblib import Parallel, delayed
 import itertools
+from tqdm import tqdm
+
 
 
 class ReportDataLoader(BaseDataLoader):
@@ -51,7 +53,10 @@ class ReportDataLoader(BaseDataLoader):
         tmp_data = data
         tmp_data = pd.pivot(tmp_data, index='datetime', columns='code', values=val_name)
         tmp_data.sort_index(inplace=True)
-        tmp_data = tmp_data.ffill()
+        days = tmp_data.index.tolist()
+        end = days[-1] + timedelta(days=2)
+        days = pd.date_range(days[0], end, freq='1d')
+        tmp_data = tmp_data.reindex(days).ffill()
         if day is not None:
             tmp_data = tmp_data[tmp_data.index <= pd.to_datetime(day) + timedelta(hours=15)]
             return tmp_data.tail(1)
@@ -65,10 +70,10 @@ class ReportDataLoader(BaseDataLoader):
         filters = cls.get_time_range(start, end)
         if trade_days is None:
             if not filters:
-                trade_days = pd.read_parquet('data/stock_bar_1day.parquet',
+                trade_days = pd.read_parquet('../../data/stock/stock_bar_1day.parquet',
                                              columns=['datetime'], engine='pyarrow')
             else:
-                trade_days = pd.read_parquet('data/stock_bar_1day.parquet',
+                trade_days = pd.read_parquet('../../data/stock/stock_bar_1day.parquet',
                                              columns=['datetime'], engine='pyarrow', filters=filters)
             trade_days = sorted(trade_days['datetime'].unique().tolist())
 
@@ -107,21 +112,34 @@ class ReportDataLoader(BaseDataLoader):
 
     @classmethod
     def get_season_id(cls, trade_days, codes, report_periods, report_data_dict):
-        idx = []
-        for day in trade_days:
+        def __get_season_id__(day):
             if not isinstance(day, str): day = day.strftime('%Y-%m-%d')
-            tmp_idx = bisect.bisect_right(report_periods, day) - 1
-            tmp_data = cls.get_newest_data(report_data_dict[report_periods[tmp_idx]],
+            cur_idx = bisect.bisect_right(report_periods, day) - 1
+            tmp_data = cls.get_newest_data(report_data_dict[report_periods[cur_idx]],
                                                             'report_period', day)
-            tmp_idx = np.array([tmp_idx] * len(codes))
-            if len(tmp_data) == 0:
-                tmp_idx = tmp_idx - 1
-            else:
-                tmp_data = tmp_data.iloc[0].reindex(codes)
-                tmp_idx = tmp_idx - 1 * (tmp_data.isna()).values
-            idx.append(tmp_idx)
-        return np.array(idx) + 1
+            tmp_data_lag1q = cls.get_newest_data(report_data_dict[report_periods[cur_idx - 1]],
+                                                            'report_period', day)
+            tmp_idx = np.array([cur_idx] * len(codes))
 
+            if len(tmp_data) == 0:
+                tmp_idx -= 1
+            else:
+                tmp_data = (tmp_data.iloc[0].reindex(codes)).isna().values
+                tmp_idx[tmp_data] -= 1
+            if len(tmp_data_lag1q) == 0:
+                tmp_idx[(tmp_idx != cur_idx)] -= 1
+            else:
+                tmp_data_lag1q = (tmp_data_lag1q.iloc[0].reindex(codes)).isna().values
+                tmp_idx[(tmp_idx != cur_idx) & tmp_data_lag1q] -= 1
+            return tmp_idx
+
+        # idx = []
+        # for i in tqdm(range(len(trade_days))):
+        #     day = trade_days[i]
+        #     idx.append(__get_season_id__(day))
+        idx = Parallel(n_jobs=16, verbose=10, backend='loky')(
+            delayed(__get_season_id__)(day) for day in trade_days)
+        return np.array(idx) + 1
 
     # @classmethod
     # def get_lag_data(cls, idx, lag, mode, fields, trade_days, report_periods, report_data_dict, codes):
@@ -191,10 +209,12 @@ class ReportDataLoader(BaseDataLoader):
                 fill_data[mask] = tmp_data[mask]
                 lag_data[col_dict[col], day_flags] = fill_data
 
-            Parallel(n_jobs=8, verbose=10, backend='threading')(
-                delayed(process_unique_i)(c, u_idx) for c, u_idx in list(itertools.product(fields, unique_idx)))
+            # Parallel(n_jobs=16, verbose=10, backend='threading')(
+            #     delayed(process_unique_i)(c, u_idx) for c, u_idx in list(itertools.product(fields, unique_idx)))
+            for c, u_idx in list(itertools.product(fields, unique_idx)):
+                process_unique_i(c, u_idx)
             data.append(lag_data)
-            cols += [col + '_lag{}'.format(_) + mode for col in cols]
+            cols += [col + '_lag{}'.format(_) + mode for col in fields]
 
         data = np.concatenate(data, axis=0)
         data = np.transpose(np.array(data), (1, 0, 2))
@@ -204,6 +224,6 @@ class ReportDataLoader(BaseDataLoader):
 
 if __name__ == '__main__':
     start = time.time()
-    ReportDataLoader.load_data('data/report_balance.parquet', fields=['total_assets'], lag='4Q')
+    ReportDataLoader.load_data('data/stock/report_balance.parquet', fields=['total_assets'], lag='4Q')
     print(time.time() - start)
 
